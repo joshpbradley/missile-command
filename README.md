@@ -1,4 +1,6 @@
 # Text-Based Missile Command
+Project completed in 2019 - year 1 of MSci Computer Science degree.
+
 A recreation of Atari's classic arcade game, Missile Command (1980), developed for PC.
 
 This project is written in C and makes use of the ncurses library to support text-based graphics.
