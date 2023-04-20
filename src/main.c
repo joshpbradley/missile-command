@@ -2,7 +2,7 @@
  * Author: Josh Bradley
  * Last Updated: 20/04/23
  * Platform: Windows. Tested on Windows 10.0.22621.
- * Description: A recreation of Atari Inc's classic arcade game, Missile Command (1980)
+ * Description: A recreation of Atari's classic arcade game, Missile Command (1980)
  * Built in C, using the PDCurses library - a Windows port of nCurses.
  *
  * To play, try to earn as many points as possible by efficiently intercepting enemy missiles before they destroy your city and missile base assets.
