@@ -1,713 +1,1605 @@
+/**
+ * Author: Josh Bradley
+ * Last Updated: 20/04/23
+ * Platform: Windows. Tested on Windows 10.0.22621.
+ * Description: A recreation of Atari Inc's classic arcade game, Missile Command (1980)
+ * Built in C, using the PDCurses library - a Windows port of nCurses.
+ *
+ * To play, try to earn as many points as possible by efficiently intercepting enemy missiles before they destroy your city and missile base assets.
+ * Left click in the viewport to launch a missile towards that position.
+ * The game continues until all cities have been destroyed.
+ */
+
 #define NCURSES_MOUSE_VERSION 2
-#define SCREEN_WIDTH 99 // should be a number where (width-59) % 8 = 0 for proper spacing
-#define SCREEN_HEIGHT 45
-#define AI_MISSILES 12 // maximum number of AI missiles firing simultaneously
-#define PLAYER_MISSILES 5 // maximum number of player missiles firing simultaneously
-#define ENEMIES_PER_ROUND 15
-#define MISSILES_PER_BASE 7
-#define RED 1 // colour definitions
+
+// The viewport width should be a number that satisfies: (x-59) % 8 = 0 for correct spacing.
+#define VIEWPORT_WIDTH 99
+#define VIEWPORT_HEIGHT 45
+
+// Total number of enemy missiles fired in a given round.
+#define ENEMY_MISSILES_PER_ROUND 18
+#define PLAYER_MISSILES_PER_ROUND (MISSILES_PER_BASE * NUMBER_OF_BASES)
+
+// The maximum number of missiles that can be fired from each base.
+#define MISSILES_PER_BASE 9
+
+#define GROUND_HEIGHT 3
+
+#define NUMBER_OF_BASES 3
+#define NUMBER_OF_CITIES 6
+
+#define BASE_WIDTH 9
+#define CITY_WIDTH 5
+
+// The number of columns between assets.
+#define ASSET_PADDING (VIEWPORT_WIDTH - 2 - (NUMBER_OF_BASES * BASE_WIDTH) - (NUMBER_OF_CITIES * CITY_WIDTH)) / 8
+
+/*
+ * The number of enemy/player missiles that can be launched simultaneously.
+ * The buffer should not exceed ENEMY_MISSILES_PER_ROUND or PLAYER_MISSILES_PER_ROUND.
+ */
+#define ENEMY_MISSILE_BUFFER 12
+#define PLAYER_MISSILE_BUFFER 4
+
+// Defines colour of character and background drawn to viewport.
+#define RED 1
 #define YELLOW 3
 #define BLUE 4
 #define CYAN 6
 #define WHITE 7
+
+// Allows for ASCII graphics to be displayed.
 #include <curses.h>
-#include <math.h> // to calculate the path taken for missiles
-#include <time.h> // used t create a delay function
-#include <stdlib.h> // random number generation
 
-struct missile // missiles fired by the player
-{
-    int active; // determines whether the missile is currently in motion
-    int currX; // the current position of the missile
-    int currY;
-    int startX; // the initial location of the missile
-    int startY;
-    int destX; // the destination of the missile
-    int destY;
-    int prevX; // the asterisk in the trail previously drawn
-    int prevY;
-    int trailCoords[SCREEN_WIDTH][SCREEN_HEIGHT]; // marks the locations of the trail
-    int explosionStage; // determines the animation stage of the missile's explosion event
-    int enableSplit;
+#include <math.h>
+#include <time.h>
+#include <stdlib.h>
+#include <windows.h>
+
+/**
+ * Vector
+ * Description: A simple container for 2D Cartesian coordinates.
+ * Fields:
+ * x - the x coordinate
+ * y - the y coordinate
+ */
+struct Vector {
+  short x;
+  short y;
 };
-void myDelay(int secs) // causes the program to temporarily halt
-{
-    const time_t start = clock();
-    time_t current;
-    do{ current = clock(); }
-    while((double)(current - start)/CLOCKS_PER_SEC < secs);
-}
-int baseStatus(int baseMissiles, int baseSurvived)
-{
-    return baseMissiles && baseSurvived;
-}
-void updateScore(int* score)
-{
-    attron(COLOR_PAIR(RED));
-    mvprintw(1, 1, "%d", *score);
-}
-int reachedDestination(struct missile m) // returns whether a missile has hit the intended target. 1 means successful.
-{
-    if(m.currX == m.destX && m.currY == m.destY) return 1;
-    else return 0;
-}
-int endRound(int* baseMissiles, int* baseSurvived, int* cityStatus, struct missile* pMissiles)
-{
-    for(int i = 0; i < PLAYER_MISSILES; i++)
-        if(pMissiles[i].active == 1) return 0;
 
-    if(!baseStatus(baseMissiles[0], baseSurvived[0]) && !baseStatus(baseMissiles[1], baseSurvived[1]) && !baseStatus(baseMissiles[2], baseSurvived[2])) return 1; // speeds up the missiles if the bases have been destroyed
+/**
+ * Base
+ * Description: A player asset. If all bases are destroyed, or all ammunition has been launched in a given round, then the round is over.
+ * Fields:
+ * isAlive - determines whether the base has been destroyed. If 1, it is alive, else if 0 it is destroyed.
+ * offset - the horizontal distance between the left edge of the viewport and the leftmost character of the city
+ * ammoCount - the remaining number of missiles that the base can fire in the current round
+ * enemyMissileTarget - the coordinate that enemy missiles set as their destination to target this asset
+ * playerMissileSource - the coordinate that player missiles set as their starting position when launched from this base
+ */
+struct Base {
+  int isAlive;
+  short offset;
+  short ammoCount;
+  struct Vector enemyMissileTarget;
+  struct Vector playerMissileSource;
+};
 
-    if(!cityStatus[0] && !cityStatus[1] && !cityStatus[2] && !cityStatus[3] && !cityStatus[4] && !cityStatus[5]) return 1;
-     // speeds up the missiles if the cities have been destroyed
-    return 0;
-}
-void printResults(int result, int* score, int* baseSurvived, int* missilesRemaining, int missilesDestroyed, int roundNumber)
+/**
+ * City
+ * Description: A player asset. If all cities are destroyed then the game is over.
+ * Fields:
+ * isAlive - determines whether the city has been destroyed. If 1, it is alive, else if 0 it is destroyed
+ * offset - the horizontal distance between the left edge of the viewport and the leftmost character of the city
+ * enemyMissileTarget - the coordinate that enemy missiles set as their destination to target this asset
+ */
+struct City {
+  int isAlive;
+  unsigned short offset;
+  struct Vector enemyMissileTarget;
+};
+
+/**
+ * Missile
+ * Description: A generic missile that represents both enemy and player missiles.
+ * Fields:
+ * currPos - the current position of the missile
+ * startPos - the start position of the missile
+ * destPos - the destination position of the missile
+ * prevPos - the previous position of the missile
+ * trailCoords - stores the location of missile trail. If an element is 1, then the two indexes representing
+ * that element represent the coordinate location.
+ * explosionTimer - coordinates timing of the missile's explosion animation
+ * explosionFrame - the animation frame of the missile's explosion
+ * canFragment - determines whether the missile can fragment. If 1, it can fragment; else if 0, it cannot.
+ * True for enemy missiles that spawned from the top of the viewport
+ * isActive - determines whether the missile is active.  If 1, it is active; else if 0, it is not.
+ * colour -  the colour of the trail made by the missile
+ */
+struct Missile
 {
-    int totalRemaining = missilesRemaining[0] + missilesRemaining[1] + missilesRemaining[2];
-    int totalBases = baseSurvived[0] + baseSurvived[1] + baseSurvived[2];
-    *score += 100 * totalBases + 5 * totalRemaining;
-    if(result == 1)
+  struct Vector currPos;
+  struct Vector startPos;
+  struct Vector destPos;
+  struct Vector prevPos;
+  unsigned short trailCoords[VIEWPORT_WIDTH][VIEWPORT_HEIGHT];
+  clock_t explosionTimer;
+  short explosionFrame;
+  int canFragment;
+  int isActive;
+  int colour;
+};
+
+/**
+ * gameStates
+ * Description: Defines all possible states that the game can be in.
+ *
+ * ongoing - normal round execution. The player can fire missiles at will.
+ * roundEnding - preparing for the end of the round. Missile speed increases.
+ * endOfRound - the end of round screen is being displayed. Showing the results of a survived round.
+ * endOfGame - the game over screen is being displayed.
+ */
+enum gameStates {ongoing, roundEnding, endOfRound, endOfGame};
+
+/**
+ * getPlayerMissilesRemaining
+ * Description: Gets the number of missiles that the player can fire in the current round.
+ * Params:
+ * bases - the collection of bases
+ * Return: the number of missiles remaining that the player can fire in the current round
+ */
+int getPlayerMissilesRemaining(struct Base bases[])
+{
+  int ammoCount = 0;
+
+  for(int i = 0; i < NUMBER_OF_BASES; i++)
+  {
+    if(bases[i].isAlive)
     {
-        mvprintw(SCREEN_HEIGHT/2 - 5, SCREEN_WIDTH/2 - 6,             "ROUND %d CLEARED"             , roundNumber);
-
-        mvprintw(SCREEN_HEIGHT/2 - 3, SCREEN_WIDTH/2 - 11,        "CIVILISATION HAS SURVIVED"          );
-
-        mvprintw(SCREEN_HEIGHT/2 - 1, SCREEN_WIDTH/2 - 4,                 "SCORE: %d"                 , *score);
-
-        mvprintw(SCREEN_HEIGHT/2 + 1, SCREEN_WIDTH/2 - 17, "MISSILES INTERCEPTED:  %02d X 25 POINTS"  , missilesDestroyed);
-        mvprintw(SCREEN_HEIGHT/2 + 2, SCREEN_WIDTH/2 - 17, "BASES SURVIVED:        %d X 100 POINTS"  , totalBases);
-        mvprintw(SCREEN_HEIGHT/2 + 3, SCREEN_WIDTH/2 - 17, "MISSILES REMAINING:     %02d X 5 POINTS"  , totalRemaining);
+      ammoCount += bases[i].ammoCount;
     }
-    else
-    {
-        mvprintw(SCREEN_HEIGHT/2 - 1, SCREEN_WIDTH/2 - 1, "THE");
-        mvprintw(SCREEN_HEIGHT/2 + 1, SCREEN_WIDTH/2 - 1, "END");
-    }
-    refresh();
-    myDelay(8);
+  }
+
+  return ammoCount;
 }
-int checkGameOver(int* cityStatus, int totalEnemies, struct missile* AIMissiles, struct missile* pMissiles, int total, int total2)
+
+/**
+ * drawScore
+ * Description: Draws the player's current score.
+ * Params:
+ * score - the player's score
+ */
+void drawScore(int score)
 {
+  attron(COLOR_PAIR(RED));
+  mvprintw(1, 1, "%d", score);
+}
+
+/**
+ * drawBaseMissileCount
+ * Description: Draws the number of missiles remaining in a given missile base.
+ * Params:
+ * b - the base to draw the missile count for
+ */
+void drawBaseMissileCount(struct Base* b)
+{
+  attron(COLOR_PAIR(CYAN));
+  mvprintw(VIEWPORT_HEIGHT - GROUND_HEIGHT - 2, b->offset + 4, "%d", b->ammoCount);
+}
+
+/**
+ * drawBases
+ * Description: Draws the bases
+ * Params:
+ * bases - the collection of bases to draw
+ */
+void drawBases(struct Base bases[])
+{
+  for(int i = 0; i < NUMBER_OF_BASES; i++)
+  {
+    if(bases[i].isAlive)
+    {
+      attron(COLOR_PAIR(YELLOW));
+
+      mvprintw(VIEWPORT_HEIGHT - GROUND_HEIGHT - 4, bases[i].offset + 2,  "/\\_/\\");
+      mvprintw(VIEWPORT_HEIGHT - GROUND_HEIGHT - 3, bases[i].offset + 1, "/XXXXX\\");
+      mvprintw(VIEWPORT_HEIGHT - GROUND_HEIGHT - 2, bases[i].offset,    "/XX   XX\\");
+
+      drawBaseMissileCount(&bases[i]);
+    }
+  }
+}
+
+/**
+ * drawCities
+ * Description: Draws the cities.
+ * Params:
+ * cities - the collection of cities to draw
+ */
+void drawCities(struct City cities[])
+{
+  attron(COLOR_PAIR(CYAN));
+
+  for(int i = 0; i < NUMBER_OF_CITIES; i++)
+  {
+    if(cities[i].isAlive)
+    {
+      mvprintw(VIEWPORT_HEIGHT - GROUND_HEIGHT - 3, cities[i].offset, "/MMM\\");
+      mvprintw(VIEWPORT_HEIGHT - GROUND_HEIGHT - 2, cities[i].offset, "|[]||");
+    }
+  }
+}
+
+/**
+ * drawLandscape
+ * Description: Draws the ground, bases and cities.
+ * Params:
+ * bases - the collection of missile bases
+ * cities - the collection of cities
+ */
+void drawLandscape(struct Base bases[], struct City cities[])
+{
+
+  // Draws ground.
+  attron(COLOR_PAIR(YELLOW));
+
+  for(int row = 0; row < GROUND_HEIGHT; row++)
+  {
+    for(int col = 0; col < VIEWPORT_WIDTH - 2; col++)
+    {
+      mvprintw(VIEWPORT_HEIGHT - 2 - row, col + 1, "X");
+    }
+  }
+
+  // Draws bases.
+  drawBases(bases);
+
+  // Draws cities.
+  drawCities(cities);
+}
+
+/**
+ * drawRoundEnd
+ * Description: Draws the text that appears at the end of a survived round.
+ * Params:
+ * score - the player's score
+ * bases - the collection of missile bases
+ * cities - the collection of cities
+ * enemyMissilesDestroyed - the number of enemy missiles intercepted in the current round
+ * roundNumber - the current round number
+ */
+void drawRoundEnd(int* score, struct Base bases[], struct City cities[], int enemyMissilesDestroyed, int roundNumber)
+{
+  int basesSurvived = 0;
+  int ammoRemaining = getPlayerMissilesRemaining(bases);
+
+  for(int i = 0; i < NUMBER_OF_BASES; i++)
+  {
+    if(bases[i].isAlive)
+    {
+      basesSurvived++;
+    }
+  }
+
+  *score += 100 * basesSurvived + 5 * ammoRemaining;
+  drawScore(*score);
+
+  attron(COLOR_PAIR(RED));
+
+  mvprintw(VIEWPORT_HEIGHT/2 - 5, VIEWPORT_WIDTH/2 - 6,             "ROUND %d CLEARED"             , roundNumber);
+
+  mvprintw(VIEWPORT_HEIGHT/2 - 3, VIEWPORT_WIDTH/2 - 11,        "CIVILISATION HAS SURVIVED"        );
+
+  mvprintw(VIEWPORT_HEIGHT/2 - 1, VIEWPORT_WIDTH/2 - 4,                 "SCORE: %d"                , *score);
+
+  mvprintw(VIEWPORT_HEIGHT/2 + 1, VIEWPORT_WIDTH/2 - 17, "MISSILES INTERCEPTED:  %02d X 25 POINTS" , enemyMissilesDestroyed);
+  mvprintw(VIEWPORT_HEIGHT/2 + 2, VIEWPORT_WIDTH/2 - 17, "BASES SURVIVED:        %d X 100 POINTS"  , basesSurvived);
+  mvprintw(VIEWPORT_HEIGHT/2 + 3, VIEWPORT_WIDTH/2 - 17, "MISSILES REMAINING:     %02d X 5 POINTS" , ammoRemaining);
+
+  /*
+   * Redraws the landscape.
+   * Corrects any visual damage to surviving bases, cities and the ground.
+   */
+  drawLandscape(bases, cities);
+
+  refresh();
+  Sleep(5000);
+}
+
+/**
+ * eraseRoundEnd
+ * Description: Erases the text that appears at game over.
+ */
+void eraseRoundEnd()
+{
+  for(int lineNumber = 0; lineNumber < 9; lineNumber++)
+  {
+    // Selects the rows that contains text.
+    if(!lineNumber || lineNumber == 2 || lineNumber == 4 || lineNumber >= 6)
+    {
+      // Replaces the row with whitespace.
+      for(int i = 1; i < VIEWPORT_WIDTH - 1; i++)
+      {
+        mvprintw(VIEWPORT_HEIGHT/2 - 5 + lineNumber, i, " ");
+      }
+    }
+  }
+}
+
+/**
+ * drawGameEnd
+ * Description: Draws the text that appears at game over.
+ */
+void drawGameEnd()
+{
+  attron(COLOR_PAIR(RED));
+  mvprintw(VIEWPORT_HEIGHT/2 - 1, VIEWPORT_WIDTH/2 - 1, "THE");
+  mvprintw(VIEWPORT_HEIGHT/2 + 1, VIEWPORT_WIDTH/2 - 1, "END");
+  refresh();
+}
+
+/**
+ * drawExplosion
+ * Description: Draws the explosion animation for missiles.
+ * Params:
+ * m - the missile to draw the explosion animation for
+ */
+void drawExplosion(struct Missile* m)
+{
+  // Alternates the colour of the explosion frames.
+  if(m->explosionFrame % 2)
+  {
+     attron(COLOR_PAIR(RED));
+  }
+  else
+  {
+    attron(COLOR_PAIR(YELLOW));
+  }
+
+  switch(m->explosionFrame)
+  {
+    case 1:
+    {
+      mvprintw(m->currPos.y, m->currPos.x,  "*");
+      break;
+    }
+    case 2:
+    {
+      mvprintw(m->currPos.y - 1, m->currPos.x,  "*");
+      mvprintw(m->currPos.y, m->currPos.x - 1, "***");
+      mvprintw(m->currPos.y + 1, m->currPos.x,  "*");
+      break;
+    }
+    case 3:
+    {
+      mvprintw(m->currPos.y - 2, m->currPos.x - 2, "* * *");
+      mvprintw(m->currPos.y - 1, m->currPos.x - 1,  "***");
+      mvprintw(m->currPos.y, m->currPos.x - 3,    "*******");
+      mvprintw(m->currPos.y + 1, m->currPos.x - 2, " *** ");
+      mvprintw(m->currPos.y + 2, m->currPos.x- 2,  "* * *");
+      break;
+    }
+    case 4:
+    {
+      mvprintw(m->currPos.y - 2, m->currPos.x - 2, "     ");
+      mvprintw(m->currPos.y - 1, m->currPos.x - 1,  " * ");
+      mvprintw(m->currPos.y, m->currPos.x - 3,    "  ***  ");
+      mvprintw(m->currPos.y + 1, m->currPos.x - 1,  " * ");
+      mvprintw(m->currPos.y + 2, m->currPos.x - 2, "     ");
+      break;
+    }
+    case 5:
+    {
+      mvprintw(m->currPos.y - 1, m->currPos.x,  " ");
+      mvprintw(m->currPos.y, m->currPos.x - 1, " * ");
+      mvprintw(m->currPos.y + 1, m->currPos.x,  " ");
+      break;
+    }
+    case 6:
+    {
+      mvprintw(m->currPos.y, m->currPos.x, " ");
+      break;
+    }
+  }
+}
+
+/**
+ * initBases
+ * Description: Initialises the state for bases.
+ * Params:
+ * bases - the collection of bases to initialise.
+ */
+void initBases(struct Base bases[])
+{
+  // Horizontal offsets for missile bases.
+  bases[0].offset = 1;
+  bases[1].offset = VIEWPORT_WIDTH/2 - 4;
+  bases[2].offset = VIEWPORT_WIDTH - 10;
+
+  for(int i = 0; i < NUMBER_OF_BASES; i++)
+  {
+    bases[i].isAlive = 1;
+    bases[i].ammoCount = MISSILES_PER_BASE;
+
+    bases[i].enemyMissileTarget.x = bases[i].offset + 4;
+    bases[i].enemyMissileTarget.y = VIEWPORT_HEIGHT - GROUND_HEIGHT - 4;
+
+    bases[i].playerMissileSource.x = bases[i].offset + 4;
+    bases[i].playerMissileSource.y = VIEWPORT_HEIGHT - GROUND_HEIGHT - 5;
+  }
+}
+
+/**
+ * initCities
+ * Description: Initialises the state for cities.
+ * Params:
+ * cities - the collection of cities that are initialised
+ * bases - the collection of bases. Provided because cities are positioned relative to the bases.
+ */
+void initCities(struct City cities[], struct Base bases[])
+{
+  // Horizontal offsets for cities.
+  for(int i = 0; i < NUMBER_OF_CITIES; i++)
+  {
+    short cityWidthsRequired = i % (NUMBER_OF_CITIES / 2);
+    int paddingRequired = cityWidthsRequired + 1;
+
+    cities[i].offset = bases[i >= (NUMBER_OF_CITIES / 2)].offset +
+                       BASE_WIDTH +
+                      (paddingRequired * ASSET_PADDING) +
+                      (cityWidthsRequired * CITY_WIDTH);
+  }
+
+  for(int i = 0; i < NUMBER_OF_CITIES; i++)
+  {
+    cities[i].isAlive = 1;
+
+    cities[i].enemyMissileTarget.x = cities[i].offset + 2;
+    cities[i].enemyMissileTarget.y = VIEWPORT_HEIGHT - GROUND_HEIGHT - 4;
+  }
+}
+
+/**
+ * isBaseActive
+ * Description: Determines whether the base is capable of firing a missile.
+ * Params:
+ * base - a pointer to the base that is inspected, to determine if it is active
+ * Returns: 1 if base is active, else 0
+ */
+int isBaseActive(struct Base* base)
+{
+  return base->ammoCount > 0 && base->isAlive;
+}
+
+/**
+ * hasMissileReachedDestination
+ * Description: Determines whether the provided missile's current location is the same as its destination location.
+ * Params:
+ * m - the missile that is inspected to determine whether it has reached its destination
+ * Returns: 1 if the missile has reached its destination, else 0
+ */
+int hasMissileReachedDestination(struct Missile* m)
+{
+  return m->currPos.x == m->destPos.x && m->currPos.y == m->destPos.y;
+}
+
+/**
+ * checkEndOfRoundPending
+ * Description: Determines whether the game state should progress to prepare for the end of the round.
+ * Params:
+ * gameState - the state of the game. This is progressed to reflect the end of the round or game as required.
+ * bases - the collection of bases
+ * cities - the collection of cities
+ * playerMissiles - the collection of player missiles
+ * enemyMissiles - the collection of enemy missiles
+ * enemyMissilesFired - the number of enemy missiles that have been created in the current round
+ */
+void checkEndOfRoundPending(enum gameStates* gameState, struct Base bases[], struct City cities[],
+                            struct Missile* playerMissiles, struct Missile* enemyMissiles, int enemyMissilesFired)
+{
+  if(*gameState != ongoing)
+  {
+    return;
+  }
+
+  int basesActive = 0;
+
+  // The player must have an active base to continue the round.
+  for(int i = 0; i <= NUMBER_OF_BASES; i++)
+  {
+    if(isBaseActive(&bases[i]))
+    {
+      basesActive = 1;
+    }
+  }
+
+  int citiesSurvived = 0;
+
+  // The player must have a city that is alive to continue the round.
+  for(int i = 0; i < NUMBER_OF_CITIES; i++)
+  {
+    if(cities[i].isAlive)
+    {
+      citiesSurvived = 1;
+    }
+  }
+
+  int enemyMissilesRemaining = 0;
+
+  /*
+   * The enemy must have missiles left to fire or missiles
+   * currently active to continue the round.
+   */
+  if(enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
+  {
+    enemyMissilesRemaining = 1;
+  }
+  else
+  {
+    for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+    {
+      if(enemyMissiles[i].isActive)
+      {
+        enemyMissilesRemaining = 1;
+      }
+    }
+  }
+
+  int playerMissilesRemaining = 0;
+
+  /*
+   * The player must have missiles remaining or missiles
+   * currently active to continue the round.
+   */
+  if(getPlayerMissilesRemaining(bases) > 0)
+  {
+    playerMissilesRemaining = 1;
+  }
+  else
+  {
+    for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
+    {
+      if(playerMissiles[i].isActive)
+      {
+        playerMissilesRemaining = 1;
+      }
+    }
+  }
+
+  if(!citiesSurvived || !basesActive || !enemyMissilesRemaining || !playerMissilesRemaining)
+  {
+    *gameState = roundEnding;
+  }
+}
+
+/**
+ * checkEndOfRound
+ * Description: Determines whether the round has ended, and whether it is a game over state or a next round state.
+ * Params:
+ * gameState - the state of the game. This is progressed to reflect the end of the round or game as required.
+ * cities - the collection of cities
+ * playerMissiles - the collection of player missiles
+ * enemyMissiles - the collection of enemy missiles
+ * enemyMissilesFired - the number of enemy missiles that have been created in the current round
+ */
+void checkEndOfRound(enum gameStates* gameState, struct City cities[], struct Missile playerMissiles[], struct Missile enemyMissiles[], int enemyMissilesFired)
+{
+  if(*gameState != roundEnding)
+  {
+    return;
+  }
+
+  // All enemy missiles must have been fired to complete the round.
+  if(enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
+  {
+    return;
+  }
+
+  int activeEnemyMissile = 0;
+
+  for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+  {
+    if(enemyMissiles[i].isActive)
+    {
+      activeEnemyMissile = 1;
+      break;
+    }
+  }
+
+  int activePlayerMissile = 0;
+
+  for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
+  {
+    if(playerMissiles[i].isActive)
+    {
+      activePlayerMissile = 1;
+      break;
+    }
+  }
+
+  // All missiles must be inactive to complete the round.
+  if(!activePlayerMissile && !activeEnemyMissile)
+  {
     int citiesSurvived = 0;
-    int activeAIMissile = 0;
-    int activePMissile = 0;
-    int activeMissile = 0;
 
-    for(int i = 0; i < 6; i++)
+    for(int i = 0; i < NUMBER_OF_CITIES; i++)
     {
-        if(cityStatus[i] == 1)
-        {
-            citiesSurvived = 1;
-            break;
-        }
-    }
-    for(int i = 0; i < total; i++)
-    {
-        if(AIMissiles[i].active == 1)
-        {
-            activeAIMissile = 1;
-            break;
-        }
-    }
-    for(int i = 0; i < total2; i++)
-    {
-        if(pMissiles[i].active == 1)
-        {
-            activePMissile = 1;
-            break;
-        }
-    }
-    activeMissile = activePMissile | activeAIMissile;
-
-    if(!activeMissile && !citiesSurvived) return -1;
-    else if(!activeMissile && totalEnemies == ENEMIES_PER_ROUND) return 1;
-    else return 0;
-}
-void deactivateAssets(struct missile* missiles, int total, int* baseOffset, int* cityOffset, int* baseSurvived, int* cityStatus)
-{ // sets the status of bases or cities to zero, if the asset has been hit with a missile
-    for(int i = 0; i < total; i++)
-    {
-        if(missiles[i].active == 1 && reachedDestination(missiles[i]))
-        {
-            for(int j = 0; j < 9; j++)
-            {
-                if(j < 3 && ((baseOffset[j] + 4) == missiles[i].destX)) // decides which asset was hit by the enemy missile (base)
-                {
-                    baseSurvived[j] = 0;
-                    break;
-                }
-                if(j >= 3 && ((cityOffset[j - 3] + 2) == missiles[i].destX)) // decides which asset was hit by the enemy missile (city)
-                {
-                    cityStatus[j - 3] = 0;
-                    break;
-                }
-            }
-        }
-    }
-}
-void formatMissiles(struct missile* missiles, int total) // formats missile values once initialised
-{
-    for(int i = 0; i < total; i++)
-    {
-        missiles[i].active = 0;
-        missiles[i].currX = -1;
-        missiles[i].currY = -1;
-        missiles[i].startX = -1;
-        missiles[i].startY = -1;
-        missiles[i].destX = -1;
-        missiles[i].destY = -1;
-        missiles[i].prevX = -1;
-        missiles[i].prevY = -1;
-        missiles[i].explosionStage = 1;
-        missiles[i].enableSplit = 1;
-
-        for(int col = 0; col < SCREEN_HEIGHT; col++)
-            for(int row = 0; row < SCREEN_WIDTH; row++)
-                missiles[i].trailCoords[row][col] = 0;
-    }
-}
-void ammoCheck(int missiles, int* baseMissiles, int index) // deactivates a base that has no ammunition to fire
-{
-     if(missiles <= 0) baseMissiles[index] = 0;
-}
-void removeTrail(struct missile* m, struct missile* missiles, int total)
-{
-   for(int j = 0; j < SCREEN_WIDTH; j++)
-    {
-        for(int k = 0; k < SCREEN_HEIGHT; k++)
-        {
-            if((*m).trailCoords[j][k] == 1)
-            {
-                int count = 0;
-
-                for(int l = 0; l < total; l++)
-                    if(missiles[l].trailCoords[j][k] == 1) count++;
-
-                (*m).trailCoords[j][k] = 0;
-
-                int charRead = mvinch(k, j);
-
-                if(count == 1 && !(((A_CHARTEXT & charRead) == '*') && ((A_COLOR & charRead) == 0x07000000))) mvprintw(k, j, " ");
-            }
-        }
-    }
-}
-void explode(int x, int y, int stage) // explosion animation for the player missiles
-{
-    if(stage == 1)
-    {
-        attron(COLOR_PAIR(RED));
-        mvprintw(y, x,  "*");
-    }
-    else if(stage == 2)
-    {
-        attron(COLOR_PAIR(YELLOW));
-        mvprintw(y - 1, x,  "*");
-        mvprintw(y, x - 1, "***");
-        mvprintw(y + 1, x,  "*");
-    }
-    else if(stage == 3)
-    {
-        attron(COLOR_PAIR(RED));
-        mvprintw(y - 2, x - 2, "* * *");
-        mvprintw(y - 1, x - 1,  "***");
-        mvprintw(y, x - 3,    "*******");
-        mvprintw(y + 1, x - 2, " *** ");
-        mvprintw(y + 2, x - 2, "* * *");
-    }
-    else if(stage == 4)
-    {
-        attron(COLOR_PAIR(YELLOW));
-        mvprintw(y - 2, x - 2, "     ");
-        mvprintw(y - 1, x - 1,  " * ");
-        mvprintw(y, x - 3,    "  ***  ");
-        mvprintw(y + 1, x - 1,  " * ");
-        mvprintw(y + 2, x - 2, "     ");
-    }
-    else if(stage == 5)
-    {
-        attron(COLOR_PAIR(RED));
-        mvprintw(y - 1, x,  " ");
-        mvprintw(y, x - 1, " * ");
-        mvprintw(y + 1, x,  " ");
-    }
-    else mvprintw(y, x, " ");
-}
-void testCollisions(struct missile* AIMissiles, int total, int* score, int* missilesDestroyed)
-{ // destroys AI missiles that have been hit with the player's missiles.
-    for(int i = 0; i < total; i++)
-    {
-        if(!reachedDestination(AIMissiles[i]))
-        {
-            int head = mvinch(AIMissiles[i].currY, AIMissiles[i].currX);
-
-            if((AIMissiles[i].active == 1) && !((((head & A_CHARTEXT) == '*') && ((head & A_COLOR) == 0x07000000)) || ((head & A_CHARTEXT) == 'X'))) // removes obscured missile as long as it isn't obscured by a white cross
-            {
-                *score += 25;
-                *missilesDestroyed += 1;
-                AIMissiles[i].active = 0;
-                removeTrail(&AIMissiles[i], AIMissiles, AI_MISSILES);
-            }
-        }
-    }
-}
-struct missile createPlayerMissile(int x, int y, int* missilesRemaining, int* baseOffset, int* baseMissiles, int* baseSurvived)
-{
-    struct missile m;
-
-    m.active = 1;
-    m.destX = x;
-    m.destY = y;
-    m.prevX = -1; // not a necessary property for player missiles
-    m.prevY = -1;
-    m.startY = SCREEN_HEIGHT - 8;
-    m.explosionStage = 1;
-    m.enableSplit = 0;
-    attron(COLOR_PAIR(BLUE));
-
-    for(int i = 0; i < SCREEN_WIDTH; i++)
-    {
-        for(int j = 0; j < SCREEN_HEIGHT; j++)
-        {
-            m.trailCoords[i][j] = 0;
-        }
+      if(cities[i].isAlive)
+      {
+        citiesSurvived = 1;
+        break;
+      }
     }
 
-	int i;
-    if(m.destX <= (SCREEN_WIDTH - 2) / 3 + 1)  // click in the left of the viewport
+    // Game over if all cities have been destroyed, else a new round begins.
+    if(!citiesSurvived)
     {
-        for(i = 0; i < 3; i++) // base preference: 0, 1, 2
-        {
-            if(baseStatus(baseMissiles[i], baseSurvived[i]) == 1)
-           {
-               m.startX = baseOffset[i] + 4;
-               missilesRemaining[i]--;
-               ammoCheck(missilesRemaining[i], baseMissiles, i);
-               break;
-           }
-        }
-        if(i == 3) // unable to fire a missile
-        {
-            m.active = 0;
-            return m;
-        }
-        mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 3, "%03d", missilesRemaining[i]); // updates ammunition count in the selected base
-    }
-    else if(x >= (SCREEN_WIDTH - 2) / 3 * 2 + 1) // click in the right of the viewport
-    {
-        for(i = 2; i > -1; i--) // base preference: 2, 1, 0
-        {
-            if(baseStatus(baseMissiles[i], baseSurvived[i]))
-            {
-               m.startX = baseOffset[i] + 4;
-               missilesRemaining[i]--;
-               ammoCheck(missilesRemaining[i], baseMissiles, i);
-               break;
-           }
-        }
-        if(i == -1) // unable to fire a missile
-        {
-            m.active = 0;
-            return m;
-        }
-        mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 3, "%03d", missilesRemaining[i]); // updates ammunition count in the selected base
-    }
-    else // click in the centre of the viewport
-    {
-        i = 1;
-        if(!baseStatus(baseMissiles[1], baseSurvived[1]))
-        {
-            if(x <= (((SCREEN_WIDTH - 2) / 2) + 1))
-            {
-                if(baseStatus(baseMissiles[0], baseSurvived[0]) == 1) i = 0;
-                else if(baseStatus(baseMissiles[2], baseSurvived[2]) == 1) i = 2;
-                else
-                {
-                    m.active = 0;
-                    return m;
-                }
-            }
-            else
-            {
-                if(baseStatus(baseMissiles[2], baseSurvived[2]) == 1) i = 2;
-                else if(baseStatus(baseMissiles[0], baseSurvived[0]) == 1) i = 0;
-                else
-                {
-                    m.active = 0;
-                    return m;
-                }
-            }
-        }
-        m.startX = baseOffset[i] + 4;
-        missilesRemaining[i]--;
-        ammoCheck(missilesRemaining[i], baseMissiles, i);
-        mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 3, "%03d", missilesRemaining[i]); // updates ammunition count in the selected base
-    }
-
-    m.currX = m.startX;
-    m.currY = m.startY;
-    m.trailCoords[m.startX][m.startY] = 1;
-
-    mvprintw(m.currY, m.currX, "*");
-    attron(COLOR_PAIR(WHITE));
-    mvprintw(m.destY, m.destX, "X");
-
-    return m;
-}
-int canSplit(struct missile* AIMissiles)
-{
-    for(int i = 0; i < AI_MISSILES; i++)
-    {
-        if((AIMissiles[i].currY == SCREEN_HEIGHT/2) && (AIMissiles[i].prevY == (AIMissiles[i].currY - 1)) && (AIMissiles[i].active == 1) && (AIMissiles[i].enableSplit == 1))
-        {
-            AIMissiles[i].enableSplit = 0;
-            return i;
-        }
-    }
-    return -1;
-}
-void updateMissiles(struct missile* missiles, int total, int clock, int endRound, int roundNumber)
-{
-    int missileSpeedAI = 2000 - (200 * (roundNumber - 1)); // sets the speed of the AI missile, the lower the value; the faster it goes
-    if(missileSpeedAI < 500) missileSpeedAI = 500;
-    int explosionSpeed = 750; // sets the speed of the explosion animation, the lower the value; the faster it goes
-    int missileSpeedPlayer = 100; // sets the speed of the missile, the lower the value; the faster it goes
-
-    if(endRound)
-    {
-        missileSpeedPlayer = 100;
-        missileSpeedAI = 100;
-    }
-    for(int i = 0; i < total; i++)
-    {
-        if(missiles[i].active == 1)
-        {
-            int flightX = missiles[i].destX - missiles[i].startX;
-            int flightY = abs(missiles[i].startY - missiles[i].destY);
-
-            if(reachedDestination(missiles[i])) // if the missile has reached its destination
-            {
-                if(missiles[i].explosionStage == 1) removeTrail(&missiles[i], missiles, total);
-
-                if(clock % explosionSpeed == 0) // sets the speed of the explosion animation
-                {
-                    explode(missiles[i].destX, missiles[i].destY, missiles[i].explosionStage);
-
-                    if(missiles[i].explosionStage == 6)
-                    {
-                        missiles[i].explosionStage = 1;
-                        missiles[i].active = 0;
-                    }
-                    else missiles[i].explosionStage++;
-
-                    continue;
-                }
-            }
-           else if(((total == PLAYER_MISSILES) && (clock % missileSpeedPlayer == 0)) || ((total == AI_MISSILES)  && (clock % missileSpeedAI == 0))) // adjust the number to affect enemy missile speed. The lower; the faster
-            {
-                missiles[i].prevY = missiles[i].currY;
-                missiles[i].prevX = missiles[i].currX;
-                if(total == AI_MISSILES && (missiles[i].prevX != -1 && missiles[i].prevY != -1))
-                { // prints the previous asterisk in the AI missile trial to red
-                    attron(COLOR_PAIR(RED));
-                    mvprintw(missiles[i].prevY, missiles[i].prevX, "*");
-                }
-                if(missiles[i].currX == missiles[i].destX) // moves missile vertically up or down
-                {
-                    if(total == AI_MISSILES) missiles[i].currY++;
-                    else missiles[i].currY--;
-                }
-                else if(abs(flightX) >= flightY) // moves the missile on trajectories with greater horizontal components using trigonometry
-                {
-                    double theta = atan2(flightY, abs(flightX));
-
-                    if(total == AI_MISSILES) missiles[i].currY = missiles[i].startY + round(tan(theta) * (abs(missiles[i].currX - missiles[i].startX) + 1));
-                    else missiles[i].currY = missiles[i].startY - round(tan(theta) * (abs(missiles[i].currX - missiles[i].startX) + 1));
-
-                    if(flightX > 0) missiles[i].currX++;
-                    else missiles[i].currX--;
-                }
-                else // moves the missile on trajectories with a greater vertical component using trigonometry
-                {
-                    double theta = atan2(abs(flightX), flightY);
-
-                    if(total == AI_MISSILES) missiles[i].currY++;
-                    else missiles[i].currY--;
-
-                    if(flightX > 0) missiles[i].currX = missiles[i].startX + round(tan(theta) * abs(missiles[i].startY - missiles[i].currY));
-                    else missiles[i].currX = missiles[i].startX - round(tan(theta) * abs(missiles[i].startY - missiles[i].currY));
-                }
-                if(total == PLAYER_MISSILES) attron(COLOR_PAIR(BLUE));
-                else attron(COLOR_PAIR(WHITE));
-
-                missiles[i].trailCoords[missiles[i].currX][missiles[i].currY] = 1;
-
-                int charRead = mvinch(missiles[i].currY, missiles[i].currX);  // does not delete front of enemy missile if player missile passes over
-                if(!(((charRead & A_CHARTEXT) == '*') && ((A_COLOR & charRead) == 0x07000000))) mvprintw(missiles[i].currY, missiles[i].currX, "*");
-            }
-        }
-    }
-}
-struct missile createAIMissile(int* baseOffset, int* baseMissiles, int* baseSurvived, int* cityOffset, int* cityStatus, int splitIndex, struct missile* AIMissiles)
-{
-    int totalTargets = 0; // spawning missiles will aim for a target that has not been deactivated
-    for(int i = 0; i < 9; i++)
-    {
-        if(i < 3 && baseStatus(baseMissiles[i], baseSurvived[i]) == 1) totalTargets++;
-
-        if((i >= 3) && (cityStatus[i - 3] == 1)) totalTargets++;
-    }
-    if(totalTargets == 0) totalTargets = 9;
-
-    int posTargetY[totalTargets];
-    int posTargetX[totalTargets];
-
-    if(totalTargets < 9) // populates arrays with possible X, Y targets if some targets have been deactivated
-    {
-        int index = 0;
-        for(int i = 0; i < 9; i++)
-        {
-            if(i < 3 && baseStatus(baseMissiles[i], baseSurvived[i]) == 1)
-            {
-                posTargetX[index] = baseOffset[i] + 4;
-                index++;
-            }
-            if(i >= 3 && cityStatus[i - 3] == 1)
-            {
-                posTargetX[index] = cityOffset[i - 3] + 2;
-                index++;
-            }
-            if(index == totalTargets) break;
-        }
-    }
-    else // populates arrays with all targets since nothing has been deactivated
-    {
-        for(int i = 0; i < 9; i++)
-        {
-            if(i < 3) posTargetX[i] = baseOffset[i] + 4;
-
-            if(i >= 3) posTargetX[i] = cityOffset[i - 3] + 2;
-        }
-    }
-
-    struct missile m;
-    m.active = 1;
-    m.explosionStage = 1;
-    m.enableSplit = 1;
-
-    if(splitIndex == -1) // default values
-    {
-        m.currY = 1;
-        m.startX = rand() % (SCREEN_WIDTH-2) + 1;
-        m.currX = m.startX;
-        m.startY = 1;
+      *gameState = endOfGame;
     }
     else
     {
-        m.startY = AIMissiles[splitIndex].currY;
-        m.startX = AIMissiles[splitIndex].currX;
-        m.currX = m.startX;
-        m.currY = m.startY;
+      *gameState = endOfRound;
+    }
+  }
+}
+
+/**
+ * destroyAssets
+ * Description: Sets the status of bases or cities to 0, if the asset has been hit with a missile explosion.
+ * Params:
+ * enemyMissiles - the collection of enemy missiles
+ * bases - the collection of missile bases. These are assets that can be destroyed by enemy missiles.
+ * cities - the collection of cities. These are assets that can be destroyed by enemy missiles.
+ */
+void destroyAssets(struct Missile enemyMissiles[], struct Base bases[], struct City cities[])
+{
+  for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+  {
+    if(hasMissileReachedDestination(&enemyMissiles[i]) && enemyMissiles[i].currPos.y == (VIEWPORT_HEIGHT - GROUND_HEIGHT - 4))
+    {
+      for(int j = 0; j < NUMBER_OF_BASES; j++)
+      {
+        // Decides which base was hit by the enemy missile.
+        if(bases[j].offset + 4 == enemyMissiles[i].destPos.x)
+        {
+          bases[j].isAlive = 0;
+          break;
+        }
+      }
+
+      for(int j = 0; j < NUMBER_OF_CITIES; j++)
+      {
+        // Decides which city was hit by the enemy missile.
+        if(cities[j].offset + 2 == enemyMissiles[i].destPos.x)
+        {
+          cities[j].isAlive = 0;
+          break;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * initMissile
+ * Description:
+ * Initialises the provided missile.
+ * This is called indirectly at the start of the game, and at the start of a new round through initMissiles().
+ * It is also called directly on creating a new missile instance.
+ * This function must be called prior to a new round beginning to prevent the missile from wrongly being considered active.
+ * Params:
+ * m - the missile to initialise
+ */
+void initMissile(struct Missile* m)
+{
+  m->isActive = 0;
+
+  m->currPos.x = -1;
+  m->currPos.y = -1;
+
+  m->startPos.x = -1;
+  m->startPos.y = -1;
+
+  m->destPos.x = -1;
+  m->destPos.y = -1;
+
+  m->prevPos.x = -1;
+  m->prevPos.y = -1;
+
+  m->explosionTimer = 0;
+
+  m->explosionFrame = 0;
+
+  m->canFragment = 0;
+
+  for(int row = 0; row < VIEWPORT_HEIGHT; row++)
+  {
+    for(int col = 0; col < VIEWPORT_WIDTH; col++)
+    {
+      m->trailCoords[col][row] = 0;
+    }
+  }
+}
+
+/**
+ * initMissiles
+ * Description: Initialises all missiles in the provided missile collection.
+ * This must be called performed prior to a new round beginning to prevent missiles wrongly being considered active.
+ * Params:
+ * missiles - the collection of missiles to initialise
+ * size - the size of the missiles[] array
+ */
+void initMissiles(struct Missile missiles[], size_t size)
+{
+  for(int i = 0; i < size; i++)
+  {
+    initMissile(&missiles[i]);
+  }
+}
+
+/**
+ * removeTrail
+ * Description: Removes the trail from the provided missile.
+ * Params:
+ * m - a pointer to the missile that will have its trail removed
+ */
+void removeTrail(struct Missile* m)
+{
+  for(int col = 0; col < VIEWPORT_WIDTH; col++)
+  {
+    for(int row = 0; row < VIEWPORT_HEIGHT; row++)
+    {
+      if(m->trailCoords[col][row])
+      {
+        m->trailCoords[col][row] = 0;
+
+        /*
+         * Only deletes parts of the trail that match the missiles colour.
+         * This prevents the trail deletion potentially triggering missile explosions (from obscuring the missile location).
+         */
+        if((A_COLOR & mvinch(row, col)) >> 24 == m->colour)
+        {
+          mvprintw(row, col, " ");
+        }
+      }
+    }
+  }
+}
+
+/**
+ * checkInterceptions
+ * Description:
+ * Destroys enemy missiles that have been hit with a player missiles.
+ * Increases the player's score by 25 for each enemy missile hit.
+ *
+ * This implementation means that enemy missiles will rarely detonate upon colliding with another enemyMissile, but
+ * this issue cannot be trivially solved unless missile head colours do not differ from the trail; and therefore preventing
+ * the need to redraw over the previous location.
+ * Params:
+ * fragmentIndexes - an array that is populated with 1 in all indexes where the same index in enemyMissiles can fragment
+ * enemyMissiles - the collection of enemyMissiles
+ */
+void checkInterceptions(struct Missile enemyMissiles[], int* score, int* enemyMissilesDestroyed)
+{
+  for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+  {
+    if(!hasMissileReachedDestination(&enemyMissiles[i]) && !enemyMissiles[i].explosionFrame)
+    {
+      chtype head = mvinch(enemyMissiles[i].currPos.y, enemyMissiles[i].currPos.x);
+
+      // Removes obscured missile as long as it is not obscured by a cross (target).
+      if(!((head & A_CHARTEXT) == '*' && (head & A_COLOR) >> 24 == WHITE) &&
+      (head & A_CHARTEXT) != 'X')
+      {
+        // Resetting the destination prevents the missile path from continuing once intercepted.
+        enemyMissiles[i].destPos.x = enemyMissiles[i].currPos.x;
+        enemyMissiles[i].destPos.y = enemyMissiles[i].currPos.y;
+
+        removeTrail(&enemyMissiles[i]);
+        enemyMissiles[i].explosionFrame = 1;
+
+        *score += 25;
+        *enemyMissilesDestroyed += 1;
+      }
+    }
+  }
+}
+
+/**
+ * checkFragment
+ * Description:
+ * Retrieves the indexes of the enemyMissiles that are able to fragment.
+ * A fragment is a second missile that forms at the current position of the base missile.
+ * Params:
+ * fragmentIndexes - an array that is populated with 1 in all indexes where the same index in enemyMissiles can fragment
+ * enemyMissiles - the collection of enemyMissiles
+ */
+void checkFragment(int fragmentIndexes[], struct Missile enemyMissiles[])
+{
+  for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+  {
+    if((enemyMissiles[i].currPos.y == VIEWPORT_HEIGHT / 2)
+    && (enemyMissiles[i].prevPos.y == (enemyMissiles[i].currPos.y - 1))
+    && (enemyMissiles[i].isActive)
+    && (enemyMissiles[i].canFragment))
+    {
+      fragmentIndexes[i] = 1;
+    }
+  }
+}
+
+double getTimeElapsed(clock_t* lastTimeRecorded)
+{
+  return ((double)(clock() - *lastTimeRecorded))/CLOCKS_PER_SEC;
+}
+
+/**
+ * updateAbstractMissile
+ * Description: Coordinates the explosion and signals whether a movement update is required for a single missile.
+ * Params:
+ * index - the index of the missile in missiles[]
+ * missiles - the collection of missiles to update
+ * gameState - the state of the game
+ * Returns: 1 if the missile should have its position updated on the current tick, else 0
+ */
+int updateAbstractMissile(int index, struct Missile missiles[], enum gameStates* gameState)
+{
+  if(missiles[index].isActive)
+  {
+    /*
+     * Initiates explosions for missiles that have reached their destination
+     * and removes their missile trail.
+     */
+    if(hasMissileReachedDestination(&missiles[index]))
+    {
+      if(!missiles[index].explosionFrame)
+      {
+        removeTrail(&missiles[index]);
+        missiles[index].explosionFrame = 1;
+      }
     }
 
-    m.prevX = m.currX;
-    m.prevY = m.currY;
+    // Attempts to progress the explosion if it has been initiated.
+    if(missiles[index].explosionFrame)
+    {
+      // Determines the speed of the explosion animation.
+      double timeBetweenExplosionUpdates = 0.1d;
 
-    for(int i = 0; i < SCREEN_WIDTH; i++)
-        for(int j = 0; j < SCREEN_HEIGHT; j++)
-            m.trailCoords[i][j] = 0;
+      if(!missiles[index].explosionTimer || getTimeElapsed(&(missiles[index].explosionTimer)) > timeBetweenExplosionUpdates)
+      {
+        missiles[index].explosionTimer = clock();
 
-    int randTarget = rand() % totalTargets; // generates a random integer for
+        drawExplosion(&missiles[index]);
 
-    m.destY = SCREEN_HEIGHT - 7; // selects a random target from the array of possible targets
-    m.destX = posTargetX[randTarget];
+        // Deactivates the missile once the explosion has finished.
+        if(missiles[index].explosionFrame == 7)
+        {
+          missiles[index].isActive = 0;
+        }
+        // Progresses the explosion animation.
+        else
+        {
+          missiles[index].explosionFrame++;
+        }
+      }
+    }
 
+    // If true, signals that the missile movement should be performed.
+    return !hasMissileReachedDestination(&missiles[index]);
+  }
+
+  return 0;
+}
+
+/**
+ * updatePlayerMissiles
+ * Description:
+ * Updates the state of player missiles.
+ * Coordinates explosions and signals whether missile movement is required.
+ * Also moves player missiles towards their destination.
+ * Params:
+ * missiles - the collection of player missiles to update
+ * gameState - the state of the game
+ * timer - coordinates timing for missile movement
+ */
+void updatePlayerMissiles(struct Missile missiles[], enum gameStates* gameState, clock_t* timer)
+{
+  // Determines the rate of enemy missile movement updates.
+  double timeBetweenMovementUpdate = (*gameState == roundEnding) ? .01d : .015d;
+
+  int updateTimer = (!*timer || getTimeElapsed(timer) > timeBetweenMovementUpdate);
+
+  for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
+  {
+    if(updateAbstractMissile(i, missiles, gameState) && updateTimer)
+    {
+      struct Vector flightPath = {missiles[i].destPos.x - missiles[i].startPos.x, abs(missiles[i].destPos.y - missiles[i].startPos.y)};
+
+      // Moves missile vertically.
+      if(missiles[i].currPos.x == missiles[i].destPos.x)
+      {
+        missiles[i].currPos.y--;
+      }
+      // Moves the missile on trajectories with a greater horizontal component.
+      else if(abs(flightPath.x) >= flightPath.y)
+      {
+        double theta = atan2(flightPath.y, abs(flightPath.x));
+
+        missiles[i].currPos.y = missiles[i].startPos.y - round(tan(theta) * (abs(missiles[i].currPos.x - missiles[i].startPos.x) + 1));
+
+        if(flightPath.x > 0)
+        {
+          missiles[i].currPos.x++;
+        }
+        else
+        {
+          missiles[i].currPos.x--;
+        }
+      }
+      // Moves the missile on trajectories with a greater vertical component.
+      else
+      {
+        double theta = atan2(abs(flightPath.x), flightPath.y);
+
+        missiles[i].currPos.y--;
+
+        if(flightPath.x > 0)
+        {
+          missiles[i].currPos.x = missiles[i].startPos.x + round(tan(theta) * abs(missiles[i].startPos.y - missiles[i].currPos.y));
+        }
+        else
+        {
+          missiles[i].currPos.x = missiles[i].startPos.x - round(tan(theta) * abs(missiles[i].startPos.y - missiles[i].currPos.y));
+        }
+      }
+
+      missiles[i].trailCoords[missiles[i].currPos.x][missiles[i].currPos.y] = 1;
+
+       //Stores the character in the missile's updated location.
+      int charRead = mvinch(missiles[i].currPos.y, missiles[i].currPos.x);
+
+      /*
+       * Draws the head of the missile.
+       *
+       * Prevents the missile path destroying enemy missiles.
+       * The path cannot draw over white asterisks (the head of enemy missiles).
+       */
+      if(!(((charRead & A_CHARTEXT) == '*') && ((A_COLOR & charRead) >> 24 == WHITE)))
+      {
+         attron(COLOR_PAIR(missiles[i].colour));
+         mvprintw(missiles[i].currPos.y, missiles[i].currPos.x, "*");
+      }
+    }
+  }
+
+  if(updateTimer)
+  {
+    *timer = clock();
+  }
+}
+
+/**
+ * updateEnemyMissiles
+ * Description:
+ * Updates the state of enemy missiles.
+ * Coordinates explosions and signals whether missile movement is required.
+ * Also moves enemy missiles towards their destination.
+ * Params:
+ * missiles - the collection of enemy missiles to update
+ * gameState - the state of the game
+ * timer - coordinates whether missile movement is to be performed on the current tick
+ * roundNumber - the current round number that modifies enemy missile speed
+ */
+void updateEnemyMissiles(struct Missile missiles[], enum gameStates* gameState, clock_t* timer, int roundNumber)
+{
+  /*
+   * Determines the rate of enemy missile movement updates.
+   * Missile speed increases as the player survives for more rounds.
+   */
+  double timeBetweenMovementUpdate = (*gameState == roundEnding) ? 1.d/100 : (1.d/4 - (1.d/30 * (roundNumber - 1)));
+
+  if(timeBetweenMovementUpdate < 1.d/100)
+  {
+    timeBetweenMovementUpdate = 1.d/100;
+  }
+
+  int updateTimer = !(*timer) || getTimeElapsed(timer) > timeBetweenMovementUpdate;
+
+  for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+  {
+    if(updateAbstractMissile(i, missiles, gameState) && updateTimer)
+    {
+      struct Vector flightPath = {missiles[i].destPos.x - missiles[i].startPos.x, missiles[i].destPos.y - missiles[i].startPos.y};
+
+      // Reprints the previous position in the trail, changing its colour to red.
+      missiles[i].prevPos.y = missiles[i].currPos.y;
+      missiles[i].prevPos.x = missiles[i].currPos.x;
+
+      attron(COLOR_PAIR(missiles[i].colour));
+      mvprintw(missiles[i].prevPos.y, missiles[i].prevPos.x, "*");
+
+      // Moves missile vertically.
+      if(missiles[i].currPos.x == missiles[i].destPos.x)
+      {
+        missiles[i].currPos.y++;
+      }
+      // Moves the missile on trajectories with a greater horizontal component than vertical.
+      else if(abs(flightPath.x) >= flightPath.y)
+      {
+        double theta = atan2(flightPath.y, abs(flightPath.x));
+
+        missiles[i].currPos.y = missiles[i].startPos.y + round(tan(theta) * (abs(missiles[i].currPos.x - missiles[i].startPos.x) + 1));
+
+        if(flightPath.x > 0)
+        {
+          missiles[i].currPos.x++;
+        }
+        else
+        {
+          missiles[i].currPos.x--;
+        }
+      }
+      // Moves the missile on trajectories with a greater vertical component than horizontal.
+      else
+      {
+        double theta = atan2(abs(flightPath.x), flightPath.y);
+
+        missiles[i].currPos.y++;
+
+        if(flightPath.x > 0)
+        {
+          missiles[i].currPos.x = missiles[i].startPos.x + round(tan(theta) * abs(missiles[i].startPos.y - missiles[i].currPos.y));
+        }
+        else
+        {
+          missiles[i].currPos.x = missiles[i].startPos.x - round(tan(theta) * abs(missiles[i].startPos.y - missiles[i].currPos.y));
+        }
+      }
+
+      missiles[i].trailCoords[missiles[i].currPos.x][missiles[i].currPos.y] = 1;
+
+      /*
+       * Draws the head of the missile.
+       *
+       * Prevents the missile path destroying enemy missiles.
+       * The path cannot draw over white asterisks (the head of enemy missiles).
+       */
+      // Stores the character in the missile's updated location.
+      int charRead = mvinch(missiles[i].currPos.y, missiles[i].currPos.x);
+      if(!(((charRead & A_CHARTEXT) == '*') && ((A_COLOR & charRead) >> 24 == WHITE)))
+      {
+        attron(COLOR_PAIR(WHITE));
+        mvprintw(missiles[i].currPos.y, missiles[i].currPos.x, "*");
+      }
+    }
+  }
+
+  if(updateTimer)
+  {
+    *timer = clock();
+  }
+}
+
+/**
+ * createPlayerMissile
+ * Description: Spawns a new player missile, targeting the location that was left-clicked on the viewport.
+ * Params:
+ * target - the X, Y location of the missile's destination in viewport coordinates
+ * bases - the collection of missile bases
+ * Returns: a new player missile
+ */
+struct Missile createPlayerMissile(struct Vector target, struct Base bases[])
+{
+  /*
+   * Holds the most appropriate order of base priority, based on their
+   * proximity from the missile's target.
+   */
+  int baseOrder[NUMBER_OF_BASES];
+
+  /*
+   * Click event in the left third of the viewport.
+   * Ranks the bases in the following priority: LEFT, CENTRE, RIGHT.
+   *
+   * If a base is not active, the next base is considered.
+   */
+  if(target.x <= ((VIEWPORT_WIDTH - 2) / 3) + 1)
+  {
+    baseOrder[0] = 0;
+    baseOrder[1] = 1;
+    baseOrder[2] = 2;
+  }
+  /*
+   * Click event in the right third of the viewport.
+   * Ranks the bases in the following priority: RIGHT, CENTRE, LEFT.
+   *
+   * If a base is not active, the next base is considered.
+   */
+  else if(target.x >= (((VIEWPORT_WIDTH - 2) / 3) * 2) + 1)
+  {
+    baseOrder[0] = 2;
+    baseOrder[1] = 1;
+    baseOrder[2] = 0;
+  }
+  else
+  {
+    /*
+     * Click event in the left half of the central third of the viewport.
+     * Ranks the bases in the following priority: CENTRE, LEFT, RIGHT.
+     *
+     * If a base is not active, the next base is considered.
+     */
+    if(target.x <= VIEWPORT_WIDTH / 2)
+    {
+      baseOrder[0] = 1;
+      baseOrder[1] = 0;
+      baseOrder[2] = 2;
+    }
+    /*
+     * Click event in the right half of the central third of the viewport.
+     * Ranks the bases in the following priority: CENTRE, RIGHT, LEFT.
+     *
+     * If a base is not active, the next base is considered.
+     */
+    else
+    {
+      baseOrder[0] = 1;
+      baseOrder[1] = 2;
+      baseOrder[2] = 0;
+    }
+  }
+
+  // Selects an active base to fire the missile.
+  int baseIndex = -1;
+  for(int i = 0; i < NUMBER_OF_BASES; i++)
+  {
+    if(isBaseActive(&bases[baseOrder[i]]))
+    {
+      bases[baseOrder[i]].ammoCount--;
+      drawBaseMissileCount(&bases[baseOrder[i]]);
+
+      baseIndex = baseOrder[i];
+
+      break;
+    }
+  }
+
+  struct Missile m;
+  initMissile(&m);
+
+  // True if a base has been selected.
+  if(baseIndex != -1)
+  {
+    m.isActive = 1;
+    m.colour = BLUE;
+
+    m.startPos.x = bases[baseIndex].playerMissileSource.x;
+    m.startPos.y = bases[baseIndex].playerMissileSource.y;
+
+    m.currPos.x = m.startPos.x;
+    m.currPos.y = m.startPos.y;
+
+    m.destPos.x = target.x;
+    m.destPos.y = target.y;
+
+    m.trailCoords[m.startPos.x][m.startPos.y] = 1;
+
+    // Draws the start position.
+    attron(COLOR_PAIR(m.colour));
+    mvprintw(m.startPos.y, m.startPos.x, "*");
+
+    // Draws the missile target.
     attron(COLOR_PAIR(WHITE));
-    mvprintw(m.startY,  m.startX, "*");
-    m.trailCoords[m.startX][m.startY] = 1;
-    return m;
+    mvprintw(m.destPos.y, m.destPos.x, "X");
+  }
+
+  return m;
 }
-void drawBox()
+
+/**
+ * createEnemyMissile
+ * Description: Spawns a new enemy missile, which attempts to target an active missile base or city that is alive.
+ * Params:
+ * enemyMissiles - the collection of enemy missiles
+ * fragmentIndex - the index of the active missile in the enemy missile buffer to fragment from
+ * bases - collection of missile bases
+ * cities - the collection of cities
+ * xPosOfTargetToAvoid - the missile target point of an asset that should not be considered a target for the missile.
+ * Returns: a new enemy missile
+ */
+struct Missile createEnemyMissile(struct Missile enemyMissiles[], int fragmentIndex, struct Base bases[], struct City cities[], short xPosOfTargetToAvoid)
 {
-    attron(COLOR_PAIR(WHITE));
+  /*
+   * Stores whether the target at the given index in targets[] is valid.
+   * For example: if targetValidity[4] == 1, then targets[4] is a valid target.
+   * else if targetValidity[4] == 0, then targets[4] is not valid.
+   */
+  int targetValidity[NUMBER_OF_BASES + NUMBER_OF_CITIES] = {0};
+  // Stores the Vectors of the missiles potential targets.
+  struct Vector targets[NUMBER_OF_BASES + NUMBER_OF_CITIES];
+  /*
+   * The index (0 - (NUMBER_OF_BASES + NUMBER_OF_CITIES - 1) representing an asset that cannot be targeted.
+   * Used to prevent a fragmented missile from targeting the same location as its base missile.
+   */
+  int targetToAvoid = -1;
+  // The number or eligible targets for the missile to target, excluding the missile to avoid (if set).
+  int totalTargets = 0;
 
-    printw("+"); // prints top row
-    for(int i = 0; i < SCREEN_WIDTH - 2; i++) printw("-");
-    printw("+");
+  // Adds base targets.
+  for(int i = 0; i < NUMBER_OF_BASES; i++)
+  {
+    targets[i] = bases[i].enemyMissileTarget;
 
-    int i; // prints rows 2-101
-    for(i = 1; i < SCREEN_HEIGHT - 1; i++)
+    // If true, prevents the base from becoming the missile's target.
+    if(bases[i].enemyMissileTarget.x == xPosOfTargetToAvoid)
     {
-        mvprintw(i, 0, "|");
-        mvprintw(i, SCREEN_WIDTH - 1, "|");
+      targetToAvoid = i;
+    }
+    else if(isBaseActive(&bases[i]))
+    {
+      totalTargets++;
+      targetValidity[i] = 1;
+    }
+  }
+
+  // Add city targets.
+  for(int i = 0; i < NUMBER_OF_CITIES; i++)
+  {
+    targets[i + NUMBER_OF_BASES] = cities[i].enemyMissileTarget;
+
+    // If true, prevents the city from becoming the missile's target.
+    if(cities[i].enemyMissileTarget.x == xPosOfTargetToAvoid)
+    {
+      targetToAvoid = i + NUMBER_OF_BASES;
+    }
+    else if(cities[i].isAlive)
+    {
+      totalTargets++;
+      targetValidity[i + NUMBER_OF_BASES] = 1;
+    }
+  }
+
+  /*
+   * If there is not a viable target, consider all of them to be valid (excluding the target to avoid, if set).
+   * Ensures enemy missile barrage completes by providing targets even when none are eligible.
+   */
+  if(!totalTargets)
+  {
+    totalTargets = NUMBER_OF_BASES + NUMBER_OF_CITIES;
+
+    // Sets the validity of all targets to 1. Sets the target to avoid to 0 (if set).
+    for(int i = 0; i < totalTargets; i++)
+    {
+      targetValidity[i] = (i != targetToAvoid);
     }
 
-    mvprintw(SCREEN_HEIGHT - 1, 0, "+"); // prints bottom row
-    for(int i = 1; i < SCREEN_WIDTH - 1; i++) mvprintw(SCREEN_HEIGHT - 1, i, "-");
-    mvprintw(SCREEN_HEIGHT - 1, SCREEN_WIDTH - 1, "+");
-}
-void drawLandscape(int* baseOffset, int* cityOffset, int* missilesRemaining)
-{
-	attron(COLOR_PAIR(YELLOW));
+    // Decreases the total targets by 1 if a target to avoid has been specified.
+    totalTargets -= (targetToAvoid != -1);
+  }
 
-    for(int i = 0; i < 3; i++)
+  // Dedicated array storing the indexes of valid targets.
+  struct Vector validTargets[totalTargets];
+
+  // Transfers the indexes of missiles eligible to fragment to the dedicated validTargets array.
+  int validTargetIndex = 0;
+  for(int i = 0; i < NUMBER_OF_BASES + NUMBER_OF_CITIES; i++)
+  {
+    if(targetValidity[i])
     {
-        for(int j = 1; j < SCREEN_WIDTH - 1; j++) mvprintw(SCREEN_HEIGHT - (2 + i), j, "X"); // prints the ground
+      validTargets[validTargetIndex] = targets[i];
+      validTargetIndex++;
+    }
+  }
 
-        mvprintw(SCREEN_HEIGHT - 5, baseOffset[i], "/XX"); // prints missile bases
-        attron(COLOR_PAIR(BLUE));
-        mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 3, "%03d", missilesRemaining[i]);
-        attron(COLOR_PAIR(YELLOW));
-        mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 6, "XX\\");
-        mvprintw(SCREEN_HEIGHT - 6, baseOffset[i] + 1, "/XXXXX\\");
-        mvprintw(SCREEN_HEIGHT - 7, baseOffset[i] + 2, ".^_^.");
+  struct Missile m;
+  initMissile(&m);
+
+  /*
+   * Initialising an enemy missile that is not from a fragment.
+   * I.e., it spawns from the top of the viewport.
+   */
+  if(fragmentIndex == -1)
+  {
+    m.canFragment = 1;
+
+    // Prevents enemyMissiles from colliding with the score and being destroyed prematurely.
+    short scoreOffset = 4;
+    m.startPos.x = rand() % (VIEWPORT_WIDTH - 2 - scoreOffset) + 1 + scoreOffset;
+    m.startPos.y = 1;
+  }
+  /*
+   * Initialising an enemy missile that is a fragment.
+   * Fragments spawns on the midpoint of the viewport's y axis, at another missile's current location.
+   */
+  else
+  {
+    m.startPos.x = enemyMissiles[fragmentIndex].currPos.x;
+    m.startPos.y = enemyMissiles[fragmentIndex].currPos.y;
+  }
+
+  m.isActive = 1;
+  m.colour = RED;
+
+  m.currPos.x = m.startPos.x;
+  m.currPos.y = m.startPos.y;
+
+  // Samples a random target from the possible targets.
+  int randomTarget = rand() % totalTargets;
+
+  m.destPos.x = validTargets[randomTarget].x;
+  m.destPos.y = validTargets[randomTarget].y;
+
+  m.trailCoords[m.startPos.x][m.startPos.y] = 1;
+
+  // Draws the head of the missile.
+  attron(COLOR_PAIR(WHITE));
+  mvprintw(m.startPos.y, m.startPos.x, "*");
+
+  return m;
+}
+
+int main(int argc, char *argv[])
+{
+  /*
+   * PDCURSES SETUP.
+   */
+  // Initialises curses. This must be the first curses function to be called in the program.
+  initscr();
+  // Sets the dimensions  of the viewport.
+  resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
+  // Sets the input mode for the current terminal to cbreak mode.
+  cbreak();
+  // Removes the cursor from the viewport.
+  curs_set(0);
+  // Enables input polling without halting the program.
+  nodelay(stdscr, TRUE);
+  // Prevents characters from keyboard input being printed to the terminal.
+  noecho();
+  // Enables keyboard/mouse input.
+  keypad(stdscr, TRUE);
+  // Enables mouse clicking interrupts.
+  mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
+
+  /*
+   * Redefines colour pair combinations.
+   * Takes the format: key, fg colour, bg colour.
+   */
+  start_color();
+  init_pair(RED, COLOR_RED, COLOR_BLACK);
+  init_pair(YELLOW, COLOR_YELLOW, COLOR_BLACK);
+  init_pair(BLUE, COLOR_BLUE, COLOR_BLACK);
+  init_pair(CYAN, COLOR_CYAN, COLOR_BLACK);
+  init_pair(WHITE, COLOR_WHITE, COLOR_BLACK);
+
+  struct Base bases[NUMBER_OF_BASES];
+  struct City cities[NUMBER_OF_CITIES];
+  // Player missile buffer.
+  struct Missile playerMissiles[PLAYER_MISSILE_BUFFER];
+  // Enemy missile buffer.
+  struct Missile enemyMissiles[ENEMY_MISSILE_BUFFER];
+  int score = 0;
+
+  /*
+   * INITIALISE ROUND VARIABLES.
+   */
+  // Coordinates timing for enemy missile spawning.
+  clock_t enemiesLastSpawnTime = 0;
+  // Coordinates timing for enemy missile movement.
+  clock_t enemiesLastUpdateTime = 0;
+  // Coordinates timing for playerMissileMovement.
+  clock_t playersLastUpdateTime = 0;
+
+  // Counts the number of enemies that have spawned in a round.
+  int enemyMissilesFired = 0;
+  // Counts the number of AI missiles intercepted in a round.
+  int enemyMissilesDestroyed = 0;
+  int roundNumber = 1;
+  enum gameStates gameState = ongoing;
+
+  // Initialise missiles.
+  initMissiles(playerMissiles, PLAYER_MISSILE_BUFFER);
+  initMissiles(enemyMissiles, ENEMY_MISSILE_BUFFER);
+
+  // Initialise assets.
+  initBases(bases);
+  initCities(cities, bases);
+
+  // Draws the ground, bases and cities.
+  drawLandscape(bases, cities);
+  // Draws the score (initially 0).
+  drawScore(score);
+
+  // Generates a seed for random value generation.
+  srand(time(NULL));
+
+  while(1)
+  {
+    // Creates a new enemy missile.
+    if(enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
+    {
+      // Stores the indexes of enemy missiles that can fragment.
+      int fragmentIndexes[ENEMY_MISSILE_BUFFER] = {0};
+      // The number of missiles that are eligible for fragmentation.
+      unsigned short numberOfMissilesCanFragment = 0;
+
+      // Populates the fragmentIndexes array with the indexes of missiles that can fragment.
+      checkFragment(fragmentIndexes, enemyMissiles);
+
+      // Calculates the number of missiles eligible for fragmentation.
+      for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+      {
+        if(fragmentIndexes[i])
+        {
+          numberOfMissilesCanFragment++;
+        }
+      }
+
+      if(numberOfMissilesCanFragment)
+      {
+        // Determines the maximum number of missiles that can be fired on this tick.
+        unsigned short maximumSpawns = ENEMY_MISSILES_PER_ROUND - enemyMissilesFired;
+
+        // A dedicated array for storing the indexes of missiles eligible for fragmenting.
+        int missilesCanFragment[numberOfMissilesCanFragment];
+
+        // Transfers the indexes of missiles eligible to fragment to the dedicated array.
+        int index = 0;
+        for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+        {
+          if(fragmentIndexes[i])
+          {
+            missilesCanFragment[index] = i;
+            index++;
+          }
+        }
+
+        // Determines the actual number to fragment. Ensures spawns cannot exceed the buffer.
+        short fragmentMissilesToSpawn = (numberOfMissilesCanFragment > maximumSpawns) ? maximumSpawns : numberOfMissilesCanFragment;
+
+        // Spawns missiles from fragmentation.
+        for(int i = 0; i < fragmentMissilesToSpawn; i++)
+        {
+          for(int j = 0; j < ENEMY_MISSILE_BUFFER; j++)
+          {
+            if(!enemyMissiles[j].isActive)
+            {
+              // Retrieves an eligible missile for fragmentation.
+              int selectedIndexToFragment = missilesCanFragment[i];
+
+              // Prevents the base missile from fragmenting multiple times.
+              enemyMissiles[selectedIndexToFragment].canFragment = 0;
+              // Creates a new missile, fragmenting from the base missile's current position.
+              enemyMissiles[j] = createEnemyMissile(enemyMissiles, selectedIndexToFragment, bases, cities, enemyMissiles[selectedIndexToFragment].destPos.x);
+              enemyMissilesFired++;
+
+              break;
+            }
+          }
+        }
+      }
+
+      // Determines the rate of enemy missile spawns from the top of the viewport.
+      double timeBetweenEnemySpawns = 2.d;
+
+      // Spawns missile from clock timing.
+      if((!enemiesLastSpawnTime || getTimeElapsed(&enemiesLastSpawnTime) > timeBetweenEnemySpawns) && enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
+      {
+        enemiesLastSpawnTime = clock();
+
+        for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
+        {
+          if(!enemyMissiles[i].isActive)
+          {
+            // Spawns an enemy missile from the top of the viewport.
+            enemyMissiles[i] = createEnemyMissile(enemyMissiles, -1, bases, cities, -1);
+            enemyMissilesFired++;
+
+            break;
+          }
+        }
+      }
     }
 
-    attron(COLOR_PAIR(CYAN));
-    for(int i = 0; i < 6; i++)
-    {
-        mvprintw(SCREEN_HEIGHT - 5, cityOffset[i], "||[]|"); // prints cities
-        mvprintw(SCREEN_HEIGHT - 6, cityOffset[i], "/MMM\\");
-    }
-}
-int main()
-{
-    int ch;
     MEVENT event;
-    int missilesRemaining[] = {MISSILES_PER_BASE, MISSILES_PER_BASE, MISSILES_PER_BASE}; // 7 missiles per base
-    int baseOffset[] = {1, SCREEN_WIDTH/2-4, SCREEN_WIDTH-10}; // horizontal offsets for missile bases
-    int padding = (SCREEN_WIDTH - (2 + (3 * 9) + (6 * 5))) / 8;
-    int cityOffset[] = {baseOffset[0] + 9 + padding, baseOffset[0] + padding * 2 + 14, baseOffset[1] - padding - 5, baseOffset[1] + 9 + padding, baseOffset[1] + padding * 2 + 14, baseOffset[2] - padding - 5}; // horizontal offsets for cities
-    int baseMissiles[] = {1, 1, 1}; // sets whether a base is capable of firing
-    int baseSurvived[] = {1, 1, 1};
-    int cityStatus[] = {1, 1, 1, 1, 1, 1}; // sets whether a city has been hit
+    int inputEvent = getch();
 
-    struct missile pMissiles[PLAYER_MISSILES];
-    formatMissiles(pMissiles, PLAYER_MISSILES);
-    struct missile AIMissiles[AI_MISSILES];
-    formatMissiles(AIMissiles, AI_MISSILES);
-
-	initscr();
-	resize_term(SCREEN_HEIGHT, SCREEN_WIDTH); // sets terminal dimensions
-    cbreak();
-	keypad(stdscr, TRUE); // enables button presses (including mouse)
-	curs_set(0); // removes the cursor from the terminal
-    mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL); // allows for mouse clicking interrupts
-    noecho();
-
-    start_color();
-    init_pair(RED, COLOR_RED, COLOR_BLACK);
-    init_pair(YELLOW, COLOR_YELLOW, COLOR_BLACK);
-    init_pair(BLUE, COLOR_BLUE, COLOR_BLACK);
-    init_pair(CYAN, COLOR_CYAN, COLOR_BLACK);
-    init_pair(WHITE, COLOR_WHITE, COLOR_BLACK);
-
-    nodelay(stdscr, TRUE); // allows for character polling without halting the program
-    drawBox();
-    drawLandscape(baseOffset, cityOffset, missilesRemaining);
-
-    srand(time(0)); // generates a pseudo-random seed for pseudo-random value generation
-
-    attron(COLOR_PAIR(RED));
-    int score = 0;
-    mvprintw(1, 1, "%d", score);
-
-    int clock = 0; // coordinates timing events within the program
-    int totalEnemies = 0; // counts the number of enemies that have spawned in a round
-    int missilesDestroyed = 0; // counts the number of AI missiles intercepted in a round
-    int result = 0; // determines the state of the game upon the completion of a round
-    int roundNumber = 1;
-
-    while(1)
+    /*
+     * Create new player missile if a valid input has been registered.
+     * Check if the input mouse left-click.
+     */
+    if(inputEvent == KEY_MOUSE && getmouse(&event) == OK && (event.bstate & BUTTON1_CLICKED))
     {
-        ch = getch();
-
-        int split = canSplit(AIMissiles);
-        if(!(clock %= 12000) || split != -1) // rate at which AI missiles spawn, the lower the value; the faster rate they spawn
+      // Check if click occurs within clickable bounds.
+      if(event.x >= 4 && event.x <= VIEWPORT_WIDTH - 5 && event.y >= 3 && event.y <= VIEWPORT_HEIGHT - 10)
+      {
+        // Check if the game state allows for missile fire and there are missiles remaining.
+        if(gameState == ongoing && getPlayerMissilesRemaining(bases) > 0)
         {
-            for(int i = 0; i < AI_MISSILES; i++)
+          for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
+          {
+            if(!playerMissiles[i].isActive)
             {
-                if(AIMissiles[i].active == 0 && totalEnemies < ENEMIES_PER_ROUND)
-                {
-                   AIMissiles[i] = createAIMissile(baseOffset, baseMissiles, baseSurvived, cityOffset, cityStatus, split, AIMissiles);
-                   totalEnemies++;
-                   break;
-                }
+              // Create a missile at the location of the click event.
+              struct Vector destination = {event.x, event.y};
+              playerMissiles[i] = createPlayerMissile(destination, bases);
+
+              break;
             }
+          }
         }
-        clock++;
-
-        if(ch == KEY_MOUSE)
-            if(getmouse(&event) == OK)
-                if(event.bstate & BUTTON1_CLICKED)
-				    if(event.x >= 4 && event.x <= SCREEN_WIDTH - 5 && event.y >= 3 && event.y <= SCREEN_HEIGHT - 10)
-                        for(int i = 0; i < PLAYER_MISSILES; i++)
-                            if(pMissiles[i].active == 0)
-                            {
-                                pMissiles[i] = createPlayerMissile(event.x, event.y, missilesRemaining, baseOffset, baseMissiles, baseSurvived);
-                                break;
-                            }
-
-        updateMissiles(pMissiles, PLAYER_MISSILES, clock, endRound(baseMissiles, baseSurvived, cityStatus, pMissiles), roundNumber);
-        updateMissiles(AIMissiles, AI_MISSILES, clock, endRound(baseMissiles, baseSurvived, cityStatus, pMissiles), roundNumber);
-        deactivateAssets(AIMissiles, AI_MISSILES, baseOffset, cityOffset, baseSurvived, cityStatus);
-        testCollisions(AIMissiles, AI_MISSILES, &score, &missilesDestroyed);
-        updateScore(&score);
-
-        result = checkGameOver(cityStatus, totalEnemies, AIMissiles, pMissiles, AI_MISSILES, PLAYER_MISSILES);
-        if(result != 0)
-        {
-            printResults(result, &score, baseSurvived, missilesRemaining, missilesDestroyed, roundNumber);
-            if(result == -1)
-            {
-                 clock = 1;
-                 ch = 0;
-                 while(1)
-                 {
-                    ;
-                 }
-            }
-
-           if(result == 1)
-           {
-                formatMissiles(pMissiles, PLAYER_MISSILES); // resets variables in preparation for the next round
-                formatMissiles(AIMissiles, AI_MISSILES);
-                clock = 0;
-                totalEnemies = 0;
-                missilesDestroyed = 0;
-                result = 0;
-                roundNumber++;
-
-                for(int i = 0; i < 3; i++)
-                {
-                    baseMissiles[i] = 1;
-                    baseSurvived[i] = 1;
-                    missilesRemaining[i] = MISSILES_PER_BASE;
-
-                    attron(COLOR_PAIR(YELLOW));
-                    mvprintw(SCREEN_HEIGHT - 5, baseOffset[i], "/XX"); // prints missile bases
-                    attron(COLOR_PAIR(BLUE));
-                    mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 3, "%03d", missilesRemaining[i]);
-                    attron(COLOR_PAIR(YELLOW));
-                    mvprintw(SCREEN_HEIGHT - 5, baseOffset[i] + 6, "XX\\");
-                    mvprintw(SCREEN_HEIGHT - 6, baseOffset[i] + 1, "/XXXXX\\");
-                    mvprintw(SCREEN_HEIGHT - 7, baseOffset[i] + 2, ".^_^.");
-                }
-
-                for(int i = 0; i < 9; i++)
-                {
-                    if(i == 0 || i == 2 || i == 4 || i >= 6)
-                    {
-                        for(int j = 1; j < SCREEN_WIDTH - 1; j++)
-                        {
-                            mvprintw(SCREEN_HEIGHT/2 - 5 + i, j, " ");
-                        }
-                    }
-                }
-            }
-        }
+      }
     }
-	endwin();
-	return 0;
+    // Prevents screen resizing.
+    else if(inputEvent == KEY_RESIZE)
+    {
+      resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
+      /*
+       * The amount of sleep affects whether the screen clips when it is resized.
+       * I do not know why this behaviour is happening.
+       * At the value of 250, the clipping does not seem to appear (Windows 10.0.22621) but that may not be universal.
+       */
+      Sleep(250);
+    }
+
+    updatePlayerMissiles(playerMissiles, &gameState, &playersLastUpdateTime);
+    updateEnemyMissiles(enemyMissiles, &gameState, &enemiesLastUpdateTime, roundNumber);
+
+    // Marks the assets that have hit been hit by enemy missiles as not being alive.
+    destroyAssets(enemyMissiles, bases, cities);
+    // Checks whether any enemy missiles have been intercepted.
+    checkInterceptions(enemyMissiles, &score, &enemyMissilesDestroyed);
+
+    drawScore(score);
+
+    // Checks whether the end of the round should initiate.
+    checkEndOfRoundPending(&gameState, bases, cities, playerMissiles, enemyMissiles, enemyMissilesFired);
+    // Checks whether the round has ended.
+    checkEndOfRound(&gameState, cities, playerMissiles, enemyMissiles, enemyMissilesFired);
+
+    // Initiate the end of the round and game.
+    if(gameState == endOfGame)
+    {
+      drawGameEnd();
+
+      // Keeps the end game screen open and prevents screen resizing.
+      while(1)
+      {
+        inputEvent = getch();
+
+        if(inputEvent == KEY_RESIZE)
+        {
+          resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
+          /*
+           * The amount of sleep affects whether the screen clips when it is resized.
+           * I do not know why this behaviour is happening.
+           * At the value of 250, the clipping does not seem to appear (Windows 10.0.22621) but that may not be universal.
+           */
+          Sleep(250);
+        }
+      }
+    }
+    // Initiate the end of the round and prepares the next round.
+    else if(gameState == endOfRound)
+    {
+      drawRoundEnd(&score, bases, cities, enemyMissilesDestroyed, roundNumber);
+
+      roundNumber++;
+
+      enemyMissilesFired = 0;
+      enemyMissilesDestroyed = 0;
+      gameState = ongoing;
+
+      initMissiles(playerMissiles, PLAYER_MISSILE_BUFFER);
+      initMissiles(enemyMissiles, ENEMY_MISSILE_BUFFER);
+
+      initBases(bases);
+      drawBases(bases);
+
+      enemiesLastSpawnTime = 0;
+      enemiesLastUpdateTime = 0;
+      playersLastUpdateTime = 0;
+
+      eraseRoundEnd();
+    }
+  }
 }
