@@ -48,6 +48,8 @@
 #define CYAN 6
 #define WHITE 7
 
+#define ESCAPE 27
+
 // Allows for ASCII graphics to be displayed.
 #include <curses.h>
 
@@ -829,9 +831,16 @@ void checkFragment(int fragmentIndexes[], struct Missile enemyMissiles[])
   }
 }
 
-double getTimeElapsed(clock_t* lastTimeRecorded)
+/**
+ * getMillisElapsed
+ * Description: Gets the elapsed time in milliseconds since the provided value was recorded.
+ * Params:
+ * lastTimeRecorded - the reference point in time that the elapsed time is calculated from
+ * Returns: the elapsed time in milliseconds since the provided value was recorded
+ */
+unsigned int getMillisElapsed(clock_t* lastTimeRecorded)
 {
-  return ((double)(clock() - *lastTimeRecorded))/CLOCKS_PER_SEC;
+  return (unsigned int)(((double)(clock() - *lastTimeRecorded)) / CLOCKS_PER_SEC * 1000);
 }
 
 /**
@@ -864,9 +873,9 @@ int updateAbstractMissile(int index, struct Missile missiles[], enum gameStates*
     if(missiles[index].explosionFrame)
     {
       // Determines the speed of the explosion animation.
-      double timeBetweenExplosionUpdates = 0.1d;
+      int millisBetweenExplosionUpdates = 100;
 
-      if(!missiles[index].explosionTimer || getTimeElapsed(&(missiles[index].explosionTimer)) > timeBetweenExplosionUpdates)
+      if(!missiles[index].explosionTimer || getMillisElapsed(&(missiles[index].explosionTimer)) > millisBetweenExplosionUpdates)
       {
         missiles[index].explosionTimer = clock();
 
@@ -906,9 +915,10 @@ int updateAbstractMissile(int index, struct Missile missiles[], enum gameStates*
 void updatePlayerMissiles(struct Missile missiles[], enum gameStates* gameState, clock_t* timer)
 {
   // Determines the rate of enemy missile movement updates.
-  double timeBetweenMovementUpdate = (*gameState == roundEnding) ? .01d : .015d;
+  unsigned short millisBetweenMovementUpdate = (*gameState == roundEnding) ? 12 : 14;
 
-  int updateTimer = (!*timer || getTimeElapsed(timer) > timeBetweenMovementUpdate);
+  // Determines whether a movement update should be performed on the current tick.
+  int updateTimer = !(*timer) || getMillisElapsed(timer) > millisBetweenMovementUpdate;
 
   for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
   {
@@ -995,16 +1005,17 @@ void updateEnemyMissiles(struct Missile missiles[], enum gameStates* gameState, 
 {
   /*
    * Determines the rate of enemy missile movement updates.
-   * Missile speed increases as the player survives for more rounds.
+   * Missile speed increases by 20% for each round survived.
    */
-  double timeBetweenMovementUpdate = (*gameState == roundEnding) ? 1.d/100 : (1.d/4 - (1.d/30 * (roundNumber - 1)));
+  unsigned short millisBetweenMovementUpdate = (*gameState == roundEnding) ? 12 : (unsigned short)(250 * pow(.8d, roundNumber - 1));
 
-  if(timeBetweenMovementUpdate < 1.d/100)
+  if(millisBetweenMovementUpdate < 12)
   {
-    timeBetweenMovementUpdate = 1.d/100;
+    millisBetweenMovementUpdate = 12;
   }
 
-  int updateTimer = !(*timer) || getTimeElapsed(timer) > timeBetweenMovementUpdate;
+  // Determines whether a movement update should be performed on the current tick.
+  int updateTimer = !(*timer) || getMillisElapsed(timer) > millisBetweenMovementUpdate;
 
   for(int i = 0; i < ENEMY_MISSILE_BUFFER; i++)
   {
@@ -1338,7 +1349,12 @@ struct Missile createEnemyMissile(struct Missile enemyMissiles[], int fragmentIn
   return m;
 }
 
-int main(int argc, char *argv[])
+/**
+ * main
+ * Description: controls the game loop and handles updates in the game's state.
+ * Returns: 0 at the end of normal program execution, else a non-zero value
+ */
+int main()
 {
   /*
    * PDCURSES SETUP.
@@ -1358,7 +1374,7 @@ int main(int argc, char *argv[])
   // Enables keyboard/mouse input.
   keypad(stdscr, TRUE);
   // Enables mouse clicking interrupts.
-  mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
+  mousemask(BUTTON1_CLICKED | REPORT_MOUSE_POSITION, NULL);
 
   /*
    * Redefines colour pair combinations.
@@ -1414,6 +1430,59 @@ int main(int argc, char *argv[])
 
   while(1)
   {
+    int inputEvent = getch();
+    MEVENT event;
+
+    switch(inputEvent)
+    {
+      case ESCAPE:
+      {
+        endwin();
+        exit(0);
+      }
+      case KEY_RESIZE:
+      {
+        resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
+        /*
+         * The amount of sleep affects whether the screen clips when it is resized.
+         * I do not know why this behaviour is happening.
+         * At the value of 300, the clipping does not seem to appear (Windows 10.0.22621) but that may not be universal.
+         */
+        Sleep(300);
+        break;
+      }
+      case KEY_MOUSE:
+      {
+        /*
+         * Create new player missile if a valid input has been registered.
+         * Check if the input mouse left-click.
+         */
+        if(getmouse(&event) == OK && (event.bstate & BUTTON1_CLICKED))
+        {
+          // Check if click occurs within clickable bounds.
+          if(event.x >= 4 && event.x <= VIEWPORT_WIDTH - 5 && event.y >= 3 && event.y <= VIEWPORT_HEIGHT - 10)
+          {
+            // Check if the game state allows for missile fire and there are missiles remaining.
+            if(gameState == ongoing && getPlayerMissilesRemaining(bases) > 0)
+            {
+              for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
+              {
+                if(!playerMissiles[i].isActive)
+                {
+                  // Create a missile at the location of the click event.
+                  struct Vector destination = {event.x, event.y};
+                  playerMissiles[i] = createPlayerMissile(destination, bases);
+
+                  break;
+                }
+              }
+            }
+          }
+        }
+        break;
+      }
+    }
+
     // Creates a new enemy missile.
     if(enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
     {
@@ -1479,10 +1548,10 @@ int main(int argc, char *argv[])
       }
 
       // Determines the rate of enemy missile spawns from the top of the viewport.
-      double timeBetweenEnemySpawns = 2.d;
+      unsigned short millisBetweenEnemySpawns = 2000;
 
       // Spawns missile from clock timing.
-      if((!enemiesLastSpawnTime || getTimeElapsed(&enemiesLastSpawnTime) > timeBetweenEnemySpawns) && enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
+      if((!enemiesLastSpawnTime || getMillisElapsed(&enemiesLastSpawnTime) > millisBetweenEnemySpawns) && enemyMissilesFired < ENEMY_MISSILES_PER_ROUND)
       {
         enemiesLastSpawnTime = clock();
 
@@ -1498,47 +1567,6 @@ int main(int argc, char *argv[])
           }
         }
       }
-    }
-
-    MEVENT event;
-    int inputEvent = getch();
-
-    /*
-     * Create new player missile if a valid input has been registered.
-     * Check if the input mouse left-click.
-     */
-    if(inputEvent == KEY_MOUSE && getmouse(&event) == OK && (event.bstate & BUTTON1_CLICKED))
-    {
-      // Check if click occurs within clickable bounds.
-      if(event.x >= 4 && event.x <= VIEWPORT_WIDTH - 5 && event.y >= 3 && event.y <= VIEWPORT_HEIGHT - 10)
-      {
-        // Check if the game state allows for missile fire and there are missiles remaining.
-        if(gameState == ongoing && getPlayerMissilesRemaining(bases) > 0)
-        {
-          for(int i = 0; i < PLAYER_MISSILE_BUFFER; i++)
-          {
-            if(!playerMissiles[i].isActive)
-            {
-              // Create a missile at the location of the click event.
-              struct Vector destination = {event.x, event.y};
-              playerMissiles[i] = createPlayerMissile(destination, bases);
-
-              break;
-            }
-          }
-        }
-      }
-    }
-    // Prevents screen resizing.
-    else if(inputEvent == KEY_RESIZE)
-    {
-      resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
-      /*
-       * The amount of sleep affects whether the screen clips when it is resized.
-       * I do not know why this behaviour is happening.
-       * At the value of 250, the clipping does not seem to appear (Windows 10.0.22621) but that may not be universal.
-       */
-      Sleep(250);
     }
 
     updatePlayerMissiles(playerMissiles, &gameState, &playersLastUpdateTime);
@@ -1566,15 +1594,23 @@ int main(int argc, char *argv[])
       {
         inputEvent = getch();
 
-        if(inputEvent == KEY_RESIZE)
+        switch(inputEvent)
         {
-          resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
-          /*
-           * The amount of sleep affects whether the screen clips when it is resized.
-           * I do not know why this behaviour is happening.
-           * At the value of 250, the clipping does not seem to appear (Windows 10.0.22621) but that may not be universal.
-           */
-          Sleep(250);
+          case ESCAPE:
+          {
+            endwin();
+            exit(0);
+          }
+          case KEY_RESIZE:
+          {
+            resize_term(VIEWPORT_HEIGHT, VIEWPORT_WIDTH);
+            /*
+             * The amount of sleep affects whether the screen clips when it is resized.
+             * I do not know why this behaviour is happening.
+             * At the value of 300, the clipping does not seem to appear (Windows 10.0.22621) but that may not be universal.
+             */
+            Sleep(300);
+          }
         }
       }
     }
