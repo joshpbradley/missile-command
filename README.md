@@ -1,5 +1,5 @@
 # Missile Command
-Project completed in 2019, in year 1 of MSci Computer Science degree.
+Project completed in 2019, in year 1 of my MSci Computer Science degree.
 
 A recreation of Atari's Missile Command (1980) built for Windows.
 
