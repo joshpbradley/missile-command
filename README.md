@@ -9,6 +9,8 @@ The aim of the game is simple: to protect civilisation from enemy missile barrag
 
 Simply aim your mouse to decide where to launch a missile, and left-click to fire. Enemy missiles must be intercepted early, or they can fragment.
 
+**GALLERY**
+
 ![Fragment](https://user-images.githubusercontent.com/48052531/233472890-92bd5840-3568-479f-bcd2-b2ce3f9a1f60.png)
 
 ![Explosions](https://user-images.githubusercontent.com/48052531/233472921-e1dbb6e0-758f-4328-8df8-45bef849fcd6.png)
